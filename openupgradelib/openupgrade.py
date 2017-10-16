@@ -24,6 +24,10 @@ import os
 import inspect
 import uuid
 import logging
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
 from contextlib import contextmanager
 try:
     from contextlib import ExitStack
@@ -46,6 +50,7 @@ except ImportError:
                 self._cms.pop().__exit__(exc_type, exc_value, traceback)
 
 from psycopg2.extensions import AsIs
+from lxml import etree
 from . import openupgrade_tools
 
 core = None
@@ -249,9 +254,16 @@ def load_data(cr, module_name, filename, idref=None, mode='init'):
     :param filename: the path to the filename, relative to the module \
     directory.
     :param idref: optional hash with ?id mapping cache?
-    :param mode: one of 'init', 'update', 'demo'. Always use 'init' \
-    for adding new items from files that are marked with 'noupdate'. Defaults \
-    to 'init'.
+    :param mode:
+        one of 'init', 'update', 'demo', 'init_no_create'.
+        Always use 'init' for adding new items from files that are marked with
+        'noupdate'. Defaults to 'init'.
+
+        'init_no_create' is a hack to load data for records which have
+        forcecreate=False set. As those records won't be recreated during the
+        update, standard Odoo would recreate the record if it was deleted,
+        but this will fail in cases where there are required fields to be
+        filled which are not contained in the data file.
     """
 
     if idref is None:
@@ -267,10 +279,44 @@ def load_data(cr, module_name, filename, idref=None, mode='init'):
                 cr, module_name, pathname, fp.read(), idref, mode, noupdate)
         elif ext == '.yml':
             yaml_import(cr, module_name, fp, None, idref=idref, mode=mode)
+        elif mode == 'init_no_create':
+            for fp2 in _get_existing_records(cr, fp, module_name):
+                tools.convert_xml_import(
+                    cr, module_name, fp2, idref, mode='init',
+                )
         else:
             tools.convert_xml_import(cr, module_name, fp, idref, mode=mode)
     finally:
         fp.close()
+
+def _get_existing_records(cr, fp, module_name):
+    """yield file like objects per 'leaf' node in the xml file that exists.
+    This is for not trying to create a record with partial data in case the
+    record was removed in the database."""
+    def yield_element(node, path=None):
+        if node.tag not in ['openerp', 'odoo', 'data']:
+            if node.tag == 'record':
+                xmlid = node.attrib['id']
+                if '.' not in xmlid:
+                    module = module_name
+                else:
+                    module, xmlid = xmlid.split('.', 1)
+                cr.execute(
+                    'select id from ir_model_data where module=%s and name=%s',
+                    (module, xmlid)
+                )
+                if not cr.rowcount:
+                    return
+            yield StringIO(etree.tostring(path))
+        else:
+            for child in node:
+                for value in yield_element(
+                        child,
+                        etree.SubElement(path, node.tag, node.attrib)
+                        if path else etree.Element(node.tag, node.attrib)
+                ):
+                    yield value
+    return yield_element(etree.parse(fp).getroot())
 
 # for backwards compatibility
 load_xml = load_data
@@ -1063,6 +1109,8 @@ def reactivate_workflow_transitions(cr, transition_conditions):
     deactivate_workflow_transitions
 
     .. versionadded:: 7.0
+    .. deprecated:: 11.0
+       Workflows were removed from Odoo as of version 11.0
     """
     for transition_id, condition in transition_conditions.iteritems():
         cr.execute(
@@ -1181,7 +1229,9 @@ def migrate(no_version=False, use_env=None, uid=None, context=None):
                     frame = inspect.getargvalues(inspect.stack()[1][0])
                     stage = frame.locals['stage']
                     module = frame.locals['pkg'].name
-                    filename = frame.locals['fp'].name
+                    # Python3: fetch pyfile from locals, not fp
+                    filename = frame.locals.get(
+                        'pyfile') or frame.locals['fp'].name
                 except Exception as e:
                     logger.error(
                         "'migrate' decorator: failed to inspect "
@@ -1199,9 +1249,12 @@ def migrate(no_version=False, use_env=None, uid=None, context=None):
                             cr, uid or SUPERUSER_ID, context or {})
                         if use_env2 else cr, version)
                 except Exception as e:
+                    message = str(e)
+                    if sys.version_info[0] == 2:
+                        message = message.decode('utf8')
                     logger.error(
-                        "%s: error in migration script %s: %s" %
-                        (module, filename, str(e).decode('utf8')))
+                        "%s: error in migration script %s: %s",
+                        module, filename, message)
                     logger.exception(e)
                     raise
         return wrapped_function
