@@ -30,6 +30,10 @@ except ImportError:
     from io import StringIO
 from contextlib import contextmanager
 try:
+    from psycopg2 import errorcodes, ProgrammingError, IntegrityError
+except ImportError:
+    from psycopg2cffi import errorcodes, ProgrammingError, IntegrityError
+try:
     from contextlib import ExitStack
 except ImportError:
 
@@ -81,7 +85,6 @@ else:
 if version_info[0] > 6 or version_info[0:2] == (6, 1):
     tools = core.tools
     SUPERUSER_ID = core.SUPERUSER_ID
-    yaml_import = tools.yaml_import
 
     if hasattr(core, 'osv') and hasattr(core.osv, 'fields'):
         except_orm = core.osv.orm.except_orm
@@ -97,6 +100,8 @@ if version_info[0] > 6 or version_info[0:2] == (6, 1):
             from odoo.exceptions import UserError
         except ImportError:  # version 8 and 9
             from openerp.exceptions import Warning as UserError
+    if version_info[0] < 12:
+        yaml_import = tools.yaml_import
 else:
     # version < 6.1
     import tools
@@ -130,12 +135,15 @@ __all__ = [
     'migrate',
     'logging',
     'load_data',
+    'add_fields',
     'copy_columns',
     'rename_columns',
+    'rename_fields',
     'rename_tables',
     'rename_models',
     'rename_xmlids',
     'add_xmlid',
+    'chunked',
     'drop_columns',
     'delete_model_workflow',
     'update_workflow_workitems',
@@ -144,6 +152,7 @@ __all__ = [
     'logged_query',
     'column_exists',
     'table_exists',
+    'update_module_moved_fields',
     'update_module_names',
     'add_ir_model_fields',
     'get_legacy_name',
@@ -159,6 +168,9 @@ __all__ = [
     'date_to_datetime_tz',
     'lift_constraints',
     'rename_property',
+    'delete_record_translations',
+    'disable_invalid_filters',
+    'delete_records_safely_by_xml_id',
 ]
 
 
@@ -191,19 +203,15 @@ def allow_pgcodes(cr, *codes):
         will be raised.
     """
     try:
-        from psycopg2 import errorcodes, ProgrammingError
-    except ImportError:
-        from psycopg2cffi import errorcodes, ProgrammingError
-
-    try:
         with cr.savepoint():
-            yield
-    except ProgrammingError as error:
+            with core.tools.mute_logger('odoo.sql_db'):
+                yield
+    except (ProgrammingError, IntegrityError) as error:
         msg = "Code: {code}. Class: {class_}. Error: {error}.".format(
             code=error.pgcode,
             class_=errorcodes.lookup(error.pgcode[:2]),
             error=errorcodes.lookup(error.pgcode))
-        if error.pgcode not in codes and error.pgcode[:2] in codes:
+        if error.pgcode in codes or error.pgcode[:2] in codes:
             logger.info(msg)
         else:
             logger.exception(msg)
@@ -380,6 +388,114 @@ def rename_columns(cr, column_spec):
             cr.execute('DROP INDEX IF EXISTS "%s_%s_index"' % (table, old))
 
 
+def rename_fields(env, field_spec, no_deep=False):
+    """Rename fields. Typically called in the pre script. WARNING: If using
+    this on base module, pass the argument ``no_deep`` with True value for
+    avoiding the using of the environment (which is not yet loaded).
+
+    This, in contrast of ``rename_columns``, performs all the steps for
+    completely rename a field from one name to another. This is needed for
+    making a complete renaming of a field with all their side features:
+    translations, filters, exports...
+
+    Call this method whenever you are not performing a pure SQL column renaming
+    for other purposes (preserve a value for example).
+
+    This method performs also the SQL column renaming, so only one call is
+    needed.
+
+    :param env: Environment/pool variable. The database cursor is the only
+      thing needed, but added in prevision of TODO tasks for not breaking
+      API later.
+    :param fields_spec: a list of tuples with the following elements:
+      * Model name. The name of the Odoo model
+      * Table name. The name of the SQL table for the model.
+      * Old field name. The name of the old field.
+      * New field name. The name of the new field.
+    :param no_deep: If True, avoids to perform any operation that involves
+      the environment. Not used for now.
+    """
+    cr = env.cr
+    for model, table, old_field, new_field in field_spec:
+        if column_exists(cr, table, old_field):
+            rename_columns(cr, {table: [(old_field, new_field)]})
+        # Rename corresponding field entry
+        cr.execute("""
+            UPDATE ir_model_fields
+            SET name = %s
+            WHERE name = %s
+                AND model = %s
+            """, (new_field, old_field, model),
+        )
+        # Rename translations
+        cr.execute("""
+            UPDATE ir_translation
+            SET name = %s
+            WHERE name = %s
+                AND type = 'model'
+            """, (
+                "%s,%s" % (model, old_field),
+                "%s,%s" % (model, new_field),
+            ),
+        )
+        # Rename appearances on export profiles
+        # TODO: Rename when the field is part of a submodel (ex. m2one.field)
+        cr.execute("""
+            UPDATE ir_exports_line
+            SET name = %s
+            WHERE name = %s
+            """, (old_field, new_field),
+        )
+        # Rename appearances on filters
+        # Example of replaced domain: [['field', '=', self], ...]
+        # TODO: Rename when the field is part of a submodel (ex. m2one.field)
+        cr.execute("""
+            UPDATE ir_filters
+            SET domain = replace(domain, %(old_pattern)s, %(new_pattern)s)
+            WHERE model_id = %%s
+                AND domain ~ %(old_pattern)s
+            """ % {
+                'old_pattern': "$$'%s'$$" % old_field,
+                'new_pattern': "$$'%s'$$" % new_field,
+            }, (model, ),
+        )
+        # Examples of replaced contexts:
+        # {'group_by': ['field', 'other_field'], 'other_key':value}
+        # {'group_by': ['date_field:month']}
+        # {'other_key': value, 'group_by': ['other_field', 'field']}
+        # {'group_by': ['other_field'],'col_group_by': ['field']}
+        cr.execute(r"""
+            UPDATE ir_filters
+            SET context = regexp_replace(
+                context, %(old_pattern)s, %(new_pattern)s
+            )
+            WHERE model_id = %%s
+                AND context ~ %(old_pattern)s
+            """ % {
+                'old_pattern': (
+                    r"$$('group_by'|'col_group_by'):([^\]]*)"
+                    r"'%s(:day|:week|:month|:year){0,1}'(.*?\])$$"
+                ) % old_field,
+                'new_pattern': r"$$\1:\2'%s\3'\4$$" % new_field,
+            }, (model, ),
+        )
+        if table_exists(env.cr, 'mail_alias'):
+            # Rename appearances on mail alias
+            cr.execute("""
+                UPDATE mail_alias ma
+                SET alias_defaults =
+                    replace(alias_defaults, %(old_pattern)s, %(new_pattern)s)
+                FROM ir_model im
+                WHERE ma.alias_model_id = im.id
+                    AND im.model = %%s
+                    AND ma.alias_defaults ~ %(old_pattern)s
+                """ % {
+                    'old_pattern': "$$'%s'$$" % old_field,
+                    'new_pattern': "$$'%s'$$" % new_field,
+                }, (model, ),
+            )
+
+
 def rename_tables(cr, table_spec):
     """
     Rename tables. Typically called in the pre script.
@@ -421,20 +537,54 @@ def rename_models(cr, model_spec):
     for (old, new) in model_spec:
         logger.info("model %s: renaming to %s",
                     old, new)
+        _old = old.replace('.', '_')
+        _new = new.replace('.', '_')
         cr.execute('UPDATE ir_model SET model = %s '
                    'WHERE model = %s', (new, old,))
-        cr.execute('UPDATE ir_model_fields SET relation = %s '
-                   'WHERE relation = %s', (new, old,))
         cr.execute('UPDATE ir_model_data SET model = %s '
                    'WHERE model = %s', (new, old,))
+        cr.execute(
+            'UPDATE ir_model_data SET name=%s '
+            "WHERE name=%s AND model = 'ir.model'",
+            ('model_' + _new, 'model_' + _old),
+        )
+        cr.execute(
+            """UPDATE ir_model_data imd
+            SET name = 'field_' || '%s' || '_' || imf.name
+            FROM ir_model_fields imf
+            WHERE imd.model = 'ir.model.fields'
+                AND imd.name = 'field_' || '%s' || '_' || imf.name
+                AND imf.model = %s""",
+            (AsIs(_new), AsIs(_old), old),
+        )
         cr.execute('UPDATE ir_attachment SET res_model = %s '
                    'WHERE res_model = %s', (new, old,))
         cr.execute('UPDATE ir_model_fields SET model = %s '
                    'WHERE model = %s', (new, old,))
-        cr.execute('UPDATE ir_translation set '
+        cr.execute('UPDATE ir_translation SET '
                    "name=%s || substr(name, strpos(name, ',')) "
-                   'where name like %s',
+                   'WHERE name LIKE %s',
                    (new, old + ',%'),)
+        # Handle properties that reference to this model
+        cr.execute("SELECT id FROM ir_model_fields "
+                   "WHERE relation = %s AND ttype = 'many2one'", (old, ))
+        field_ids = [x[0] for x in cr.fetchall()]
+        cr.execute('UPDATE ir_model_fields SET relation = %s '
+                   'WHERE relation = %s', (new, old,))
+        if field_ids:
+            logged_query(
+                cr, """
+                UPDATE ir_property
+                SET value_reference = regexp_replace(
+                    value_reference, %(old_pattern)s, %(new_pattern)s
+                )
+                WHERE fields_id IN %(field_ids)s
+                AND value_reference ~ %(old_pattern)s""", {
+                    'field_ids': tuple(field_ids),
+                    'old_pattern': r"^%s,[ ]*([0-9]*)" % old,
+                    'new_pattern': r"%s,\1" % new,
+                },
+            )
         if is_module_installed(cr, 'mail'):
             # fortunately, the data model didn't change up to now
             cr.execute(
@@ -638,6 +788,7 @@ def set_defaults(cr, pool, default_spec, force=False, use_orm=False):
     Set default value. Useful for fields that are newly required. Uses orm, so
     call from the post script.
 
+    :param pool: In v10 and newer, you have to pass the 'env' instead.
     :param default_spec: a hash with model names as keys. Values are lists \
     of tuples (field, value). None as a value has a special meaning: it \
     assigns the default value. If this value is provided by a function, the \
@@ -659,12 +810,19 @@ def set_defaults(cr, pool, default_spec, force=False, use_orm=False):
         if use_orm:
             for res_id in ids:
                 # Iterating over ids here as a workaround for lp:1131653
-                obj.write(cr, SUPERUSER_ID, [res_id], {field: value})
+                if isinstance(pool, api.Environment):
+                    obj.write({field: value})
+                else:
+                    obj.write(cr, SUPERUSER_ID, [res_id], {field: value})
         else:
             query, params = "UPDATE %s SET %s = %%s WHERE id IN %%s" % (
                 obj._table, field), (value, tuple(ids))
             # handle fields inherited from somewhere else
-            if field not in obj._columns:
+            if version_info[0] >= 10:
+                columns = obj._fields
+            else:
+                columns = obj._columns
+            if field not in columns:
                 query, params = None, None
                 for model_name in obj._inherits:
                     if obj._inherit_fields[field][0] != model_name:
@@ -689,13 +847,16 @@ def set_defaults(cr, pool, default_spec, force=False, use_orm=False):
                 cr.execute(query, (params[0], sub_ids))
 
     for model in default_spec.keys():
-        obj = pool.get(model)
-        if not obj:
+        obj = pool.get(model, False)
+        if obj == False:
             do_raise(
                 "Migration: error setting default, no such model: %s" % model)
         for field, value in default_spec[model]:
             domain = not force and [(field, '=', False)] or []
-            ids = obj.search(cr, SUPERUSER_ID, domain)
+            if isinstance(pool, api.Environment):
+                ids = obj.search(domain).ids
+            else:
+                ids = obj.search(cr, SUPERUSER_ID, domain)
             if not ids:
                 continue
             if value is None:
@@ -705,9 +866,9 @@ def set_defaults(cr, pool, default_spec, force=False, use_orm=False):
                 # object. We retrieve create_uid for this purpose and need to
                 # call the defaults function per resource. Otherwise, write
                 # all resources at once.
-                if field in obj._defaults:
-                    if not callable(obj._defaults[field]):
-                        write_value(ids, field, obj._defaults[field])
+                if version_info[0] > 7:
+                    if obj.default_get([field]):
+                        write_value(ids, field, obj.default_get([field]))
                     else:
                         cr.execute(
                             "SELECT id, COALESCE(create_uid, 1) FROM %s " %
@@ -719,33 +880,59 @@ def set_defaults(cr, pool, default_spec, force=False, use_orm=False):
                         for user_id in user_id_map:
                             write_value(
                                 user_id_map[user_id], field,
-                                obj._defaults[field](obj, cr, user_id, None))
+                                obj.default_get([field])(
+                                    obj, cr, user_id, None))
                 else:
-                    error = (
-                        "OpenUpgrade: error setting default, field %s with "
-                        "None default value not in %s' _defaults" % (
-                            field, model))
-                    logger.error(error)
-                    # this exception seems to get lost in a higher up try block
-                    except_orm("OpenUpgrade", error)
+                    if field in obj._defaults:
+                        if not callable(obj._defaults[field]):
+                            write_value(ids, field, obj._defaults[field])
+                        else:
+                            cr.execute(
+                                "SELECT id, COALESCE(create_uid, 1) FROM %s " %
+                                obj._table + "WHERE id in %s", (tuple(ids),))
+                            # Execute the function once per user_id
+                            user_id_map = {}
+                            for row in cr.fetchall():
+                                user_id_map.setdefault(row[1], []).append(
+                                    row[0])
+                            for user_id in user_id_map:
+                                write_value(
+                                    user_id_map[user_id], field,
+                                    obj._defaults[field](
+                                        obj, cr, user_id, None))
+                    else:
+                        error = (
+                            "OpenUpgrade: error setting default, field %s "
+                            "with None default value not in %s' _defaults" % (
+                                field, model))
+                        logger.error(error)
+                        # this exc. seems to get lost in a higher up try block
+                        except_orm("OpenUpgrade", error)
             else:
                 write_value(ids, field, value)
 
 
-def logged_query(cr, query, args=None):
+def logged_query(cr, query, args=None, skip_no_result=False):
     """
     Logs query and affected rows at level DEBUG.
 
     :param query: a query string suitable to pass to cursor.execute()
-    :param args: a list, tuple or dictionary passed as substitution values \
-to cursor.execute().
+    :param args: a list, tuple or dictionary passed as substitution values
+      to cursor.execute().
+    :param skip_no_result: If True, then logging details are only shown
+      if there are affected records.
     """
     if args is None:
         args = ()
     args = tuple(args) if type(args) == list else args
-    cr.execute(query, args)
-    logger.debug('Running %s', query % args)
-    logger.debug('%s rows affected', cr.rowcount)
+    try:
+        cr.execute(query, args)
+    except (ProgrammingError, IntegrityError) as error:
+        logger.error('Error running %s' % cr.mogrify(query, args))
+        raise
+    if not skip_no_result or cr.rowcount:
+        logger.debug('Running %s', query % args)
+        logger.debug('%s rows affected', cr.rowcount)
     return cr.rowcount
 
 
@@ -787,7 +974,7 @@ def update_module_names(cr, namespec, merge_modules=False):
         # to auto-remove related resources
         query = ("UPDATE ir_model_data "
                  "SET name = name || '_openupgrade_' || id, "
-                 "module = %s"
+                 "module = %s "
                  "WHERE module = %s")
         logged_query(cr, query, (new_name, old_name))
         query = ("UPDATE ir_module_module_dependency SET name = %s "
@@ -798,6 +985,14 @@ def update_module_names(cr, namespec, merge_modules=False):
                      "WHERE module = %s")
             logged_query(cr, query, (new_name, old_name))
         if merge_modules:
+            # Conserve old_name's state if new_name is uninstalled
+            logged_query(
+                cr,
+                "UPDATE ir_module_module m1 SET state=m2.state "
+                "FROM ir_module_module m2 WHERE m1.name=%s AND "
+                "m2.name=%s AND m1.state='uninstalled'",
+                (new_name, old_name),
+            )
             query = "DELETE FROM ir_module_module WHERE name = %s"
             logged_query(cr, query, [old_name])
             logged_query(
@@ -1249,9 +1444,7 @@ def migrate(no_version=False, use_env=None, uid=None, context=None):
                             cr, uid or SUPERUSER_ID, context or {})
                         if use_env2 else cr, version)
                 except Exception as e:
-                    message = str(e)
-                    if sys.version_info[0] == 2:
-                        message = message.decode('utf8')
+                    message = repr(e) if sys.version_info[0] == 2 else str(e)
                     logger.error(
                         "%s: error in migration script %s: %s",
                         module, filename, message)
@@ -1529,3 +1722,296 @@ def rename_property(cr, model, old_name, new_name):
     cr.execute(
         "update ir_property set name=%s where fields_id in %s",
         (new_name, field_ids))
+
+
+def delete_record_translations(cr, module, xml_ids):
+    """Cleanup translations of specific records in a module.
+
+    :param module: module name
+    :param xml_ids: a tuple or list of xml record IDs
+    """
+    if not isinstance(xml_ids, (list, tuple)):
+        do_raise("XML IDs %s must be a tuple or list!" % (xml_ids))
+
+    cr.execute("""
+        SELECT model, res_id
+        FROM ir_model_data
+        WHERE module = %s AND name in %s
+    """, (module, tuple(xml_ids),))
+    for row in cr.fetchall():
+        query = ("""
+            DELETE FROM ir_translation
+            WHERE module = %s AND name LIKE %s AND res_id = %s;
+        """)
+        logged_query(cr, query, (module, row[0] + ',%', row[1],))
+
+
+def disable_invalid_filters(env):
+    """It analyzes all the existing active filters to check if they are still
+    correct. If not, they are disabled for avoiding errors when clicking on
+    them, or worse, if they are default filters when opening the model/action.
+
+    To be run at the base end-migration script for having a general scope. Only
+    assured to work on > v8.
+
+    :param env: Environment parameter.
+    """
+    try:
+        from odoo.tools.safe_eval import safe_eval
+    except ImportError:
+        from openerp.tools.safe_eval import safe_eval
+    import time
+    try:
+        basetring
+    except:  # For Python 3 compatibility
+        basestring = str
+
+    def format_message(f):
+        msg = "FILTER DISABLED: "
+        if f.user_id:
+            msg += "Filter '%s' for user '%s'" % (f.name, f.user_id.name)
+        else:
+            msg += "Global Filter '%s'" % f.name
+        msg += " for model '%s' has been disabled " % f.model_id
+        return msg
+
+    filters = env['ir.filters'].search([('domain', '!=', '[]')])
+    for f in filters:
+        if f.model_id not in env:
+            continue  # Obsolete or invalid model
+        model = env[f.model_id]
+        columns = (
+            getattr(model, '_columns', False) or getattr(model, '_fields')
+        )
+        # DOMAIN
+        try:
+            # Strange artifact found in a filter
+            domain = f.domain.replace('%%', '%')
+            model.search(
+                safe_eval(domain, {'time': time, 'uid': env.uid}),
+                limit=1,
+            )
+        except Exception:
+            logger.warning(
+                format_message(f) + "as it contains an invalid domain."
+            )
+            f.active = False
+            continue
+        # CONTEXT GROUP BY
+        try:
+            context = safe_eval(f.context, {'time': time, 'uid': env.uid})
+        except Exception:
+            logger.warning(
+                format_message(f) + "as it contains an invalid context %s.",
+                f.context
+            )
+            f.active = False
+            continue
+        keys = ['group_by', 'col_group_by']
+        for key in keys:
+            if not context.get(key):
+                continue
+            g = context[key]
+            if not g:
+                continue
+            if isinstance(g, basestring):
+                g = [g]
+            for field_expr in g:
+                field = field_expr.split(':')[0]  # Remove date specifiers
+                if not columns.get(field):
+                    logger.warning(
+                        format_message(f) +
+                        "as it contains an invalid %s." % key
+                    )
+                    f.active = False
+                    break
+
+
+def add_fields(env, field_spec):
+    """This method adds all the needed stuff for having a new field populated in
+    the DB (SQL column, ir.model.fields entry, ir.model.data entry...).
+
+    It's intended for being run in pre-migration scripts for pre-populating
+    fields that are going to be declared later in the module.
+
+    NOTE: This only works in >=v8 and is not needed in >=v12, as now Odoo always
+    add the XML-ID entry:
+    https://github.com/odoo/odoo/blob/9201f92a4f29a53a014b462469f27b32dca8fc5a/
+    odoo/addons/base/models/ir_model.py#L794-L802
+
+    :param: field_spec: List of tuples with the following expected elements
+      for each tuple:
+
+      * field name
+      * model name
+      * SQL table name: Put `False` if the model is already loaded in the
+        registry and thus the SQL table name can be obtained that way.
+      * field type: binary, boolean, char, date, datetime, float, html, integer,
+        many2many, many2one, monetary, one2many, reference, selection, text,
+        serialized. The list can vary depending on Odoo version or custom added
+        field types.
+      * SQL field type: If the field type is custom or it's one of the special
+        cases (see below), you need to indicate here the SQL type to use
+        (from the valid PostgreSQL types):
+        https://www.postgresql.org/docs/9.6/static/datatype.html
+      * module name: for adding the XML-ID entry.
+    """
+    sql_type_mapping = {
+        'binary': 'bytea',  # If there's attachment, no SQL. Force it manually
+        'boolean': 'bool',
+        'char': 'varchar',  # Force it manually if there's size limit
+        'date': 'date',
+        'datetime': 'timestamp',
+        'float': 'numeric',  # Force manually to double precision if no digits
+        'html': 'text',
+        'integer': 'int4',
+        'many2many': False,  # No need to create SQL column
+        'many2one': 'int4',
+        'monetary': 'numeric',
+        'one2many': False,  # No need to create SQL column
+        'reference': 'varchar',
+        'selection': 'varchar',  # Can be sometimes integer. Force it manually
+        'text': 'text',
+        'serialized': 'text',
+    }
+    for vals in field_spec:
+        field_name, model_name, table_name, field_type, sql_type, module = vals
+        # Add SQL column
+        if not table_name:
+            table_name = env[model_name]._table
+        sql_type = sql_type_mapping.get(field_type)
+        if sql_type:
+            logged_query(
+                env.cr, """ALTER TABLE %s ADD COLUMN %s %s""",
+                (AsIs(table_name), AsIs(field_name), AsIs(sql_type)),
+            )
+        # Add ir.model.fields entry
+        env.cr.execute(
+            "SELECT id FROM ir_model WHERE model = %s", (model_name, ),
+        )
+        row = env.cr.fetchone()
+        if not row:
+            continue
+        model_id = row[0]
+        logged_query(
+            env.cr, """
+            INSERT INTO ir_model_fields (
+                model_id, model, name, field_description, ttype, state
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s
+            ) RETURNING id""",
+            (model_id, model_name, field_name, 'OU', field_type, 'base'),
+        )
+        field_id = env.cr.fetchone()[0]
+        # Add ir.model.data entry
+        if not module:
+            continue
+        name1 = 'field_%s_%s' % (model_name.replace('.', '_'), field_name)
+        logged_query(
+            env.cr, """
+            INSERT INTO ir_model_data (
+                name, date_init, date_update, module, model, res_id
+            ) VALUES (
+                %s, (now() at time zone 'UTC'), (now() at time zone 'UTC'), 
+                %s, %s, %s
+            )""", (name1, module, 'ir.model.fields', field_id),
+        )
+
+
+def update_module_moved_fields(cr, model, moved_fields, old_module, new_module):
+    """Update module for field definition in general tables that have been moved
+    from one module to another.
+
+    NOTE: This is not needed in >=v12, as now Odoo always add the XML-ID entry:
+    https://github.com/odoo/odoo/blob/9201f92a4f29a53a014b462469f27b32dca8fc5a/
+    odoo/addons/base/models/ir_model.py#L794-L802
+
+    :param cr: Database cursor
+    :param model: model name
+    :param moved_fields: list of moved fields
+    :param old_module: previous module of the fields
+    :param new_module: new module of the fields
+    """
+    if version_info[0] <= 7:
+        do_raise("This only works for Odoo version >=v8")
+    if version_info[0] >= 12:
+        do_raise("This should be used only for Odoo version <v12")
+    if not isinstance(moved_fields, (list, tuple)):
+        do_raise("moved_fields %s must be a tuple or list!" % moved_fields)
+    logger.info(
+        "Moving fields %s in model %s from module '%s' to module '%s'",
+        ', '.join(moved_fields), model, old_module, new_module,
+    )
+    vals = {
+        'new_module': new_module,
+        'old_module': old_module,
+        'model': model,
+        'fields': tuple(moved_fields),
+    }
+    # update xml-id entries
+    logged_query(
+        cr, """
+        UPDATE ir_model_data imd
+        SET module = %(new_module)s
+        FROM ir_model_fields imf
+        WHERE
+            imf.model = %(model)s AND
+            imf.name IN %(fields)s AND
+            imd.module = %(old_module)s AND
+            imd.res_id = imf.id AND
+            imd.id NOT IN (
+               SELECT id FROM ir_model_data WHERE module = %(new_module)s
+            )
+        """, vals,
+    )
+    # update ir_translation - it covers both <=v8 through type='field' and
+    # >=v9 through type='model' + name
+    logged_query(
+        cr, """
+        UPDATE ir_translation it
+        SET module = %(new_module)s
+        FROM ir_model_fields imf
+        WHERE
+            imf.model = %(model)s AND
+            imf.name IN %(fields)s AND
+            it.res_id = imf.id AND
+            it.module = %(old_module)s AND ((
+                it.name LIKE 'ir.model.fields,field_%%' AND
+                it.type = 'model'
+            ) OR (
+                it.type = 'field'
+            ))
+        """, vals,
+    )
+
+
+def delete_records_safely_by_xml_id(env, xml_ids):
+    """This removes in the safest possible way the records whose XML-IDs are
+    passed as argument.
+
+    :param xml_ids: List of XML-ID string identifiers of the records to remove.
+    """
+    for xml_id in xml_ids:
+        logger.debug('Deleting record for XML-ID %s', xml_id)
+        try:
+            with env.cr.savepoint():
+                env.ref(xml_id).exists().unlink()
+        except Exception as e:
+            logger.error('Error deleting XML-ID %s: %s', xml_id, repr(e))
+
+
+def chunked(records, single=True):
+    """ Memory and performance friendly method to iterate over a potentially
+    large number of records. Yields either a whole chunk or a single record
+    at the time. Don't nest calls to this method. """
+    size = core.models.PREFETCH_MAX
+    model = records._name
+    ids = records.with_context(prefetch_fields=False).ids
+    for i in range(0, len(ids), size):
+        records.env.invalidate_all()
+        chunk = records.env[model].browse(ids[i:i + size])
+        if single:
+            for record in chunk:
+                yield record
+            continue
+        yield chunk
