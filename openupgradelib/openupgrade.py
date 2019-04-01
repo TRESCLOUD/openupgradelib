@@ -353,6 +353,9 @@ def copy_columns(cr, column_spec):
                 continue
             if new is None:
                 new = get_legacy_name(old)
+            # en caso que la columna de respaldo ya exista
+            if column_exists(cr, table_name, new):
+                continue
             if field_type is None:
                 cr.execute("""
                     SELECT data_type
