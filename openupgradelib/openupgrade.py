@@ -347,6 +347,10 @@ def copy_columns(cr, column_spec):
     """
     for table_name in column_spec.keys():
         for (old, new, field_type) in column_spec[table_name]:
+            # Modificado por TRESCLOUD
+            # en caso que el campo enviado no exista
+            if not column_exists(cr, table_name, old):
+                continue
             if new is None:
                 new = get_legacy_name(old)
             if field_type is None:
