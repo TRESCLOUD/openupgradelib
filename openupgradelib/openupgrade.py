@@ -1534,9 +1534,15 @@ def move_field_m2o(
         cr.execute(query, [tuple(ok_ids)])
         for res in cr.fetchall():
             if res[1] and binary_field:
-                pool[registry_new_model].write(
-                    cr, SUPERUSER_ID, res[0],
-                    {field_new_model: res[1][:]})
+                #MODIFICADO POR TRESCLOUD
+                try:
+                    pool[registry_new_model].write(
+                        cr, SUPERUSER_ID, res[0],
+                        {field_new_model: res[1][:]})
+                except:
+                    logger.info("Datos del campo binario %s del objeto %s con problemas de transformacion: %s", 
+                                (field_new_model, registry_new_model ,str(res)))
+                #########################
             else:
                 pool[registry_new_model].write(
                     cr, SUPERUSER_ID, res[0],
