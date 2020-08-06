@@ -24,16 +24,14 @@
 # the 7.0 -> 8.0 migration. It is kept in later editions to keep all the API
 # docs in the latest release.
 
+from psycopg2 import sql
 
-from datetime import datetime
 try:
     from openerp import SUPERUSER_ID
 except ImportError:
     from odoo import SUPERUSER_ID
-try:
-    from openerp.tools import DEFAULT_SERVER_DATETIME_FORMAT as DATETIME_FMT
-except ImportError:
-    from odoo.tools import DEFAULT_SERVER_DATETIME_FORMAT as DATETIME_FMT
+
+from .openupgrade import logged_query
 
 
 def get_last_post_for_model(cr, uid, ids, model_pool):
@@ -78,16 +76,16 @@ def set_message_last_post(cr, uid, pool, models):
         models = [models]
     for model in models:
         model_pool = pool[model]
-        cr.execute('SELECT id FROM {table}'.format(table=model_pool._table))
-        obj_ids = [row[0] for row in cr.fetchall()]
-        for res_id, value in get_last_post_for_model(
-                cr, uid, obj_ids, model_pool).iteritems():
-            if not value:
-                continue
-            cr.execute(
-                "UPDATE {} SET message_last_post = %s WHERE id = %s".format(
-                    model_pool._table),
-                (datetime.strptime(value, DATETIME_FMT), res_id))
+        query = sql.SQL("""
+            UPDATE {table} main
+            SET message_last_post = mm.last_date
+            FROM (SELECT res_id, MAX(date) AS last_date
+                  FROM mail_message
+                  WHERE model = %s AND date IS NOT NULL
+                  GROUP BY res_id) AS mm
+            WHERE main.id = mm.res_id
+        """).format(table=sql.Identifier(model_pool._table))
+        logged_query(cr, query, (model,))
 
 
 def update_aliases(
